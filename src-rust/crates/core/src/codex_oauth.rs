@@ -32,6 +32,7 @@ pub const CODEX_MODELS: &[(&str, &str)] = &[
     ("gpt-5.1-codex-mini", "GPT-5.1 Codex Mini"),
     ("gpt-5.1-codex-max", "GPT-5.1 Codex Max"),
     ("gpt-5.4", "GPT-5.4"),
+    ("gpt-5.4-mini", "GPT-5.4 Mini"),
     ("gpt-5.2", "GPT-5.2"),
 ];
 
