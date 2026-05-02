@@ -303,6 +303,8 @@ impl CodexProvider {
             .unwrap_or_else(|| json_val.to_string())
     }
 
+    /// SSE frame parsing utility for streaming optimization.
+    #[allow(dead_code)]
     fn parse_stream_frame(
         provider_id: &ProviderId,
         event_name: &str,
@@ -359,40 +361,64 @@ impl CodexProvider {
         &self,
         request: &ProviderRequest,
     ) -> Result<ProviderResponse, ProviderError> {
-        let token = self.access_token().await?;
         let account_id = self.account_id();
-
         let body = Self::build_responses_body(request);
 
-        let builder = self
-            .http_client
-            .post(CODEX_API_ENDPOINT)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json");
-        let builder = self.codex_headers(builder, &token, account_id.as_deref());
+        let mut attempt = 0;
+        let (status, text) = loop {
+            let token = if attempt == 0 {
+                self.access_token().await?
+            } else {
+                let refresh = self.tokens.lock().unwrap().refresh_token.clone();
+                let Some(refresh) = refresh else {
+                    return Err(ProviderError::AuthFailed {
+                        provider: self.id.clone(),
+                        message: "Codex access token was rejected and no refresh token is available"
+                            .to_string(),
+                    });
+                };
+                debug!(attempt, "Retrying Codex request after token refresh");
+                self.refresh_token(&refresh).await?
+            };
 
-        let resp = builder
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Other {
+            let builder = self
+                .http_client
+                .post(CODEX_API_ENDPOINT)
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json");
+            let builder = self.codex_headers(builder, &token, account_id.as_deref());
+
+            let resp = builder
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| ProviderError::Other {
+                    provider: self.id.clone(),
+                    message: format!("HTTP request failed: {}", e),
+                    status: None,
+                    body: None,
+                })?;
+
+            let status = resp.status().as_u16();
+            let text = resp.text().await.map_err(|e| ProviderError::Other {
                 provider: self.id.clone(),
-                message: format!("HTTP request failed: {}", e),
-                status: None,
+                message: format!("Failed to read response body: {}", e),
+                status: Some(status),
                 body: None,
             })?;
 
-        let status = resp.status().as_u16();
-        let text = resp.text().await.map_err(|e| ProviderError::Other {
-            provider: self.id.clone(),
-            message: format!("Failed to read response body: {}", e),
-            status: Some(status),
-            body: None,
-        })?;
+            if status == 401 && attempt == 0 {
+                attempt += 1;
+                warn!("Codex request returned 401; attempting one token refresh");
+                continue;
+            }
 
-        if !(200..300).contains(&(status as usize)) {
-            return Err(parse_error_response(status, &text, &self.id));
-        }
+            if !(200..300).contains(&(status as usize)) {
+                return Err(parse_error_response(status, &text, &self.id));
+            }
+
+            break (status, text);
+        };
 
         let json_val: Value = serde_json::from_str(&text).map_err(|e| ProviderError::Other {
             provider: self.id.clone(),
@@ -408,42 +434,69 @@ impl CodexProvider {
         &self,
         request: &ProviderRequest,
     ) -> Result<reqwest::Response, ProviderError> {
-        let token = self.access_token().await?;
         let account_id = self.account_id();
-
         let mut body = Self::build_responses_body(request);
         body["stream"] = json!(true);
 
-        let builder = self
-            .http_client
-            .post(CODEX_API_ENDPOINT)
-            .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream");
-        let builder = self.codex_headers(builder, &token, account_id.as_deref());
+        let mut attempt = 0;
+        loop {
+            let token = if attempt == 0 {
+                self.access_token().await?
+            } else {
+                let refresh = self.tokens.lock().unwrap().refresh_token.clone();
+                let Some(refresh) = refresh else {
+                    return Err(ProviderError::AuthFailed {
+                        provider: self.id.clone(),
+                        message: "Codex access token was rejected and no refresh token is available"
+                            .to_string(),
+                    });
+                };
+                debug!(attempt, "Retrying Codex streaming request after token refresh");
+                self.refresh_token(&refresh).await?
+            };
 
-        let resp = builder
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Other {
-                provider: self.id.clone(),
-                message: format!("HTTP request failed: {}", e),
-                status: None,
-                body: None,
-            })?;
+            let builder = self
+                .http_client
+                .post(CODEX_API_ENDPOINT)
+                .header("Content-Type", "application/json")
+                .header("Accept", "text/event-stream");
+            let builder = self.codex_headers(builder, &token, account_id.as_deref());
 
-        let status = resp.status().as_u16();
-        if !(200..300).contains(&(status as usize)) {
-            let text = resp.text().await.map_err(|e| ProviderError::Other {
-                provider: self.id.clone(),
-                message: format!("Failed to read response body: {}", e),
-                status: Some(status),
-                body: None,
-            })?;
-            return Err(parse_error_response(status, &text, &self.id));
+            let resp = builder
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| ProviderError::Other {
+                    provider: self.id.clone(),
+                    message: format!("HTTP request failed: {}", e),
+                    status: None,
+                    body: None,
+                })?;
+
+            let status = resp.status().as_u16();
+            if status == 401 && attempt == 0 {
+                let text = resp.text().await.map_err(|e| ProviderError::Other {
+                    provider: self.id.clone(),
+                    message: format!("Failed to read response body: {}", e),
+                    status: Some(status),
+                    body: None,
+                })?;
+                warn!(body = %text, "Codex streaming request returned 401; attempting one token refresh");
+                attempt += 1;
+                continue;
+            }
+            if !(200..300).contains(&(status as usize)) {
+                let text = resp.text().await.map_err(|e| ProviderError::Other {
+                    provider: self.id.clone(),
+                    message: format!("Failed to read response body: {}", e),
+                    status: Some(status),
+                    body: None,
+                })?;
+                return Err(parse_error_response(status, &text, &self.id));
+            }
+
+            return Ok(resp);
         }
-
-        Ok(resp)
     }
 
     // -----------------------------------------------------------------------
@@ -583,6 +636,9 @@ impl CodexProvider {
     // Synthetic streaming  (same pattern as CopilotProvider)
     // -----------------------------------------------------------------------
 
+    /// Fallback wrapper for non-streaming responses; used in earlier implementation,
+    /// available for future non-streaming or cached-response scenarios.
+    #[allow(dead_code)]
     fn stream_synthetic_response(
         response: ProviderResponse,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>> {
@@ -694,7 +750,7 @@ impl LlmProvider for CodexProvider {
             let mut saw_tool_call = false;
             let mut open_blocks: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
-            'outer: while let Some(chunk_result) = byte_stream.next().await {
+            while let Some(chunk_result) = byte_stream.next().await {
                 let chunk = match chunk_result {
                     Ok(chunk) => chunk,
                     Err(e) => {
@@ -925,7 +981,6 @@ impl LlmProvider for CodexProvider {
                                             model: model_name.clone(),
                                             usage: UsageInfo::default(),
                                         });
-                                        message_started = true;
                                     }
 
                                     let mut remaining: Vec<usize> = open_blocks.drain().collect();
