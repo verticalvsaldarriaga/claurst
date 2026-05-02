@@ -562,15 +562,24 @@ async fn main() -> anyhow::Result<()> {
             Some(auth) => auth,
             None => {
                 if is_headless {
-                    anyhow::bail!(
-                        "No API key found. Options:\n\
-                         - Set ANTHROPIC_API_KEY for Anthropic\n\
-                         - Set OPENAI_API_KEY for OpenAI\n\
-                         - Set GOOGLE_API_KEY for Google Gemini\n\
-                         - Set GROQ_API_KEY for Groq (fast, free tier available)\n\
-                         - Run `claurst --provider ollama` for local models (no key needed)\n\
-                         - Run `claurst auth login` for Anthropic OAuth"
-                    );
+                    // Check if OAuth tokens file exists; if so, the issue is likely expiry/refresh failure
+                    let has_oauth_tokens = claurst_core::oauth::OAuthTokens::load().await.is_some();
+                    if has_oauth_tokens {
+                        anyhow::bail!(
+                            "Your Anthropic OAuth session has expired or is invalid. \
+                             Run `claurst auth login` to renew your authentication."
+                        );
+                    } else {
+                        anyhow::bail!(
+                            "No API key found. Options:\n\
+                             - Set ANTHROPIC_API_KEY for Anthropic\n\
+                             - Set OPENAI_API_KEY for OpenAI\n\
+                             - Set GOOGLE_API_KEY for Google Gemini\n\
+                             - Set GROQ_API_KEY for Groq (fast, free tier available)\n\
+                             - Run `claurst --provider ollama` for local models (no key needed)\n\
+                             - Run `claurst auth login` for Anthropic OAuth"
+                        );
+                    }
                 } else {
                     (String::new(), false)
                 }
