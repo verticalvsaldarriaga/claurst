@@ -1318,9 +1318,16 @@ pub mod config {
                         let _ = r.save().await;
                         Some(r)
                     };
-                    refreshed.unwrap_or(tokens)
+                    match refreshed {
+                        Some(r) => r,
+                        None => {
+                            tracing::warn!("Anthropic OAuth token refresh failed. Run `claurst auth login` to re-authenticate.");
+                            return None;
+                        }
+                    }
                 } else {
-                    tokens // expired, no refresh token → can't fix
+                    tracing::warn!("Anthropic OAuth token is expired with no refresh token. Run `claurst auth login` to re-authenticate.");
+                    return None;
                 }
             } else {
                 tokens
