@@ -9,7 +9,7 @@
 // - Rate-limit (429) and overloaded (529) retry with exponential back-off
 // - Authentication via API key from env or config
 
-use claurst_core::constants::{ANTHROPIC_API_VERSION, ANTHROPIC_BETA_HEADER};
+use claurst_core::constants::{ANTHROPIC_API_VERSION, ANTHROPIC_BETA_HEADER, OAUTH_BETA_HEADER};
 use claurst_core::error::ClaudeError;
 use claurst_core::types::{ContentBlock, Message, MessageContent, Role, ToolDefinition, UsageInfo};
 use futures::StreamExt;
@@ -791,7 +791,7 @@ pub mod client {
             &self,
             body: &Value,
         ) -> Result<reqwest::Response, ClaudeError> {
-            let url = format!("{}/v1/messages", self.config.api_base);
+            let url = format!("{}/v1/messages?beta=true", self.config.api_base);
             let mut attempts = 0u32;
             let mut delay = self.config.initial_retry_delay;
 

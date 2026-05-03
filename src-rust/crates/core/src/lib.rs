@@ -1810,6 +1810,7 @@ pub mod constants {
     pub const ANTHROPIC_BETA_HEADER: &str =
         "interleaved-thinking-2025-05-14,token-efficient-tools-2025-02-19,files-api-2025-04-14,\
          effort-2025-11-24";
+    pub const OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";
 
     // File system
     pub const CLAUDE_MD_FILENAME: &str = "AGENTS.md";
