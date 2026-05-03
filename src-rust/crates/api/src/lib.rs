@@ -9,7 +9,7 @@
 // - Rate-limit (429) and overloaded (529) retry with exponential back-off
 // - Authentication via API key from env or config
 
-use claurst_core::constants::{ANTHROPIC_API_VERSION, ANTHROPIC_BETA_HEADER};
+use claurst_core::constants::{ANTHROPIC_API_VERSION, ANTHROPIC_BETA_HEADER, OAUTH_BETA_HEADER};
 use claurst_core::error::ClaudeError;
 use claurst_core::types::{ContentBlock, Message, MessageContent, Role, ToolDefinition, UsageInfo};
 use futures::StreamExt;
@@ -725,7 +725,7 @@ pub mod client {
             &self,
             body: &Value,
         ) -> Result<reqwest::Response, ClaudeError> {
-            let url = format!("{}/v1/messages", self.config.api_base);
+            let url = format!("{}/v1/messages?beta=true", self.config.api_base);
             let mut attempts = 0u32;
             let mut delay = self.config.initial_retry_delay;
 
@@ -742,14 +742,22 @@ pub mod client {
                 let billing_header = format!("cc_version=0.1; cc_entrypoint=claude_code; {}; cc_workload=claude_code;", cch_hash);
 
                 // Use Bearer auth for Claude.ai OAuth tokens; x-api-key for regular keys.
+                let beta_header = if self.config.use_bearer_auth {
+                    format!("{},{}", OAUTH_BETA_HEADER, &self.config.beta_features)
+                } else {
+                    self.config.beta_features.clone()
+                };
                 let mut req = self
                     .http
                     .post(&url)
                     .header("anthropic-version", &self.config.api_version)
-                    .header("anthropic-beta", &self.config.beta_features)
-                    .header("content-type", "application/json")
-                    .header("accept", "text/event-stream")
-                    .header("x-anthropic-billing-header", billing_header);
+                    .header("anthropic-beta", beta_header)
+                    .header("content-type", "application/json");
+
+                // Only add billing header for API key auth, not OAuth
+                if !self.config.use_bearer_auth {
+                    req = req.header("x-anthropic-billing-header", billing_header);
+                }
                 req = if self.config.use_bearer_auth {
                     req.header("Authorization", format!("Bearer {}", &self.config.api_key))
                 } else {
