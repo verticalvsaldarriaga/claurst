@@ -1295,14 +1295,30 @@ pub mod config {
                         let Ok(client) = reqwest::Client::builder()
                             .timeout(std::time::Duration::from_secs(30))
                             .build() else { break 'refresh None; };
-                        let Ok(resp) = client
+                        let resp = match client
                             .post(crate::oauth::TOKEN_URL)
                             .header("content-type", "application/json")
                             .header("anthropic-beta", crate::constants::OAUTH_BETA_HEADER)
                             .json(&body)
                             .send()
-                            .await else { break 'refresh None; };
-                        if !resp.status().is_success() { break 'refresh None; }
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Anthropic OAuth token refresh request failed");
+                                break 'refresh None;
+                            }
+                        };
+                        let status = resp.status();
+                        if !status.is_success() {
+                            let body_text = resp.text().await.unwrap_or_default();
+                            tracing::warn!(
+                                status = %status,
+                                body = %body_text,
+                                "Anthropic OAuth token refresh returned non-2xx response"
+                            );
+                            break 'refresh None;
+                        }
                         let Ok(data) = resp.json::<serde_json::Value>().await else { break 'refresh None; };
                         let new_at = data["access_token"].as_str().unwrap_or("").to_string();
                         if new_at.is_empty() { break 'refresh None; }
