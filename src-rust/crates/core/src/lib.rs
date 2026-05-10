@@ -1380,72 +1380,13 @@ pub mod config {
 
             let tokens = crate::oauth::OAuthTokens::load().await?;
 
-            // If expired and we have a refresh token, attempt silent refresh.
-            // Clone the refresh token up-front so we don't borrow `tokens` during the async call.
-            let refresh_token_owned = tokens.refresh_token.clone();
             let tokens = if tokens.is_expired() {
-                if let Some(rt) = refresh_token_owned {
-                    // Inline the refresh HTTP call (cc_core can't depend on cc_cli::oauth_flow).
-                    let body = serde_json::json!({
-                        "grant_type": "refresh_token",
-                        "refresh_token": rt,
-                        "client_id": crate::oauth::CLIENT_ID,
-                        "scope": crate::oauth::ALL_SCOPES.join(" "),
-                    });
-                    let refreshed = 'refresh: {
-                        let Ok(client) = reqwest::Client::builder()
-                            .timeout(std::time::Duration::from_secs(30))
-                            .build() else { break 'refresh None; };
-                        let resp = match client
-                            .post(crate::oauth::TOKEN_URL)
-                            .header("content-type", "application/json")
-                            .header("anthropic-beta", crate::constants::OAUTH_BETA_HEADER)
-                            .json(&body)
-                            .send()
-                            .await
-                        {
-                            Ok(r) => r,
-                            Err(e) => {
-                                tracing::warn!(error = %e, "Anthropic OAuth token refresh request failed");
-                                break 'refresh None;
-                            }
-                        };
-                        let status = resp.status();
-                        if !status.is_success() {
-                            let body_text = resp.text().await.unwrap_or_default();
-                            tracing::warn!(
-                                status = %status,
-                                body = %body_text,
-                                "Anthropic OAuth token refresh returned non-2xx response"
-                            );
-                            break 'refresh None;
-                        }
-                        let Ok(data) = resp.json::<serde_json::Value>().await else { break 'refresh None; };
-                        let new_at = data["access_token"].as_str().unwrap_or("").to_string();
-                        if new_at.is_empty() { break 'refresh None; }
-                        let new_rt = data["refresh_token"].as_str().map(String::from);
-                        let exp_in = data["expires_in"].as_u64().unwrap_or(3600);
-                        let exp_ms = chrono::Utc::now().timestamp_millis() + (exp_in as i64 * 1000);
-                        let scopes: Vec<String> = data["scope"]
-                            .as_str().unwrap_or("").split_whitespace().map(String::from).collect();
-                        let mut r = tokens.clone();
-                        r.access_token = new_at;
-                        if let Some(nrt) = new_rt { r.refresh_token = Some(nrt); }
-                        r.expires_at_ms = Some(exp_ms);
-                        r.scopes = scopes;
-                        let _ = r.save().await;
-                        Some(r)
-                    };
-                    match refreshed {
-                        Some(r) => r,
-                        None => {
-                            tracing::warn!("Anthropic OAuth token refresh failed. Run `claurst auth login` to re-authenticate.");
-                            return None;
-                        }
+                match tokens.refresh().await {
+                    Some(r) => r,
+                    None => {
+                        tracing::warn!("Anthropic OAuth token refresh failed. Run `claurst auth login` to re-authenticate.");
+                        return None;
                     }
-                } else {
-                    tracing::warn!("Anthropic OAuth token is expired with no refresh token. Run `claurst auth login` to re-authenticate.");
-                    return None;
                 }
             } else {
                 tokens
@@ -3624,6 +3565,60 @@ pub mod oauth {
             let path = Self::token_file_path();
             let content = tokio::fs::read_to_string(&path).await.ok()?;
             serde_json::from_str(&content).ok()
+        }
+
+        /// Attempt a silent refresh using the stored refresh token.
+        /// Scope is intentionally omitted from the request body — per RFC 6749 the
+        /// server reissues the same scopes as the original grant.
+        pub async fn refresh(&self) -> Option<Self> {
+            let rt = self.refresh_token.clone()?;
+            let body = serde_json::json!({
+                "grant_type": "refresh_token",
+                "refresh_token": rt,
+                "client_id": CLIENT_ID,
+            });
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .ok()?;
+            let resp = match client
+                .post(TOKEN_URL)
+                .header("content-type", "application/json")
+                .header("anthropic-beta", crate::constants::OAUTH_BETA_HEADER)
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Anthropic OAuth token refresh request failed");
+                    return None;
+                }
+            };
+            let status = resp.status();
+            if !status.is_success() {
+                let body_text = resp.text().await.unwrap_or_default();
+                tracing::warn!(
+                    status = %status,
+                    body = %body_text,
+                    "Anthropic OAuth token refresh returned non-2xx response"
+                );
+                return None;
+            }
+            let data = resp.json::<serde_json::Value>().await.ok()?;
+            let new_at = data["access_token"].as_str().filter(|s| !s.is_empty())?.to_string();
+            let new_rt = data["refresh_token"].as_str().map(String::from);
+            let exp_in = data["expires_in"].as_u64().unwrap_or(3600);
+            let exp_ms = chrono::Utc::now().timestamp_millis() + (exp_in as i64 * 1000);
+            let scopes: Vec<String> = data["scope"]
+                .as_str().unwrap_or("").split_whitespace().map(String::from).collect();
+            let mut refreshed = self.clone();
+            refreshed.access_token = new_at;
+            if let Some(nrt) = new_rt { refreshed.refresh_token = Some(nrt); }
+            refreshed.expires_at_ms = Some(exp_ms);
+            if !scopes.is_empty() { refreshed.scopes = scopes; }
+            let _ = refreshed.save().await;
+            Some(refreshed)
         }
 
         pub async fn clear() -> anyhow::Result<()> {
