@@ -1,7 +1,7 @@
 # Codex OAuth / Provider Change Summary
 
-Status: completed for documentation generation; code status described as observed in the current tree.
-Date: 2026-05-02
+Status: updated 2026-05-10 with session 2 fixes.
+Date: 2026-05-02 (initial) / 2026-05-10 (follow-up)
 Repo: `claurst-git`
 
 ## Executive summary
@@ -289,6 +289,33 @@ The following items remain intentionally open and should be tracked as next-step
 - Do not delete “unused” stream helpers unless confirmed obsolete.
 - Do not change context-collapse behavior as part of Codex OAuth work.
 - Keep OAuth/token logic isolated from message semantic changes.
+
+---
+
+## Session 2 fixes (2026-05-10)
+
+### Anthropic OAuth token refresh — three bugs fixed
+
+**Root cause chain:** The access token in `~/.claurst/oauth_tokens.json` expired on ~May 3. The silent refresh was failing for three independent reasons:
+
+#### Fix 1 — Missing `anthropic-beta` header (`lib.rs`)
+The refresh POST to `https://platform.claude.com/v1/oauth/token` was missing the required `anthropic-beta: oauth-2025-04-20` header. The endpoint rejects requests without it.
+
+#### Fix 2 — Invalid scope in refresh body (`lib.rs`)
+The refresh body included `"scope": ALL_SCOPES.join(" ")` which contains `org:create_api_key`. The token endpoint rejects this with `invalid_scope` on a refresh grant. Per RFC 6749 the scope field should be omitted entirely on refresh — the server reissues the original scopes.
+
+#### Fix 3 — Silent failure swallowed the error (`lib.rs`)
+The original code used `break 'refresh None` on any non-2xx without logging the HTTP status or body, making the `invalid_scope` response invisible. Now logs status code and response body at `WARN` level.
+
+### Refactor — `OAuthTokens::refresh()` method (`lib.rs`)
+
+The inline 40-line refresh block in `resolve_anthropic_auth_async` was extracted into a proper `pub async fn refresh(&self) -> Option<Self>` method on `OAuthTokens` inside `pub mod oauth`. `resolve_anthropic_auth_async` now calls `tokens.refresh().await`. All three fixes above are in the new method.
+
+### Voice PTT — plain-V binding removed (`tui/src/app.rs`)
+
+`app.rs` was restored from upstream main (recovering the full voice recording implementation lost in the merge conflict at `370c7fa`), then the plain `V` key hold-to-talk binding and its key-release handler were intentionally removed. The `Alt+V` toggle remains the only PTT activation path.
+
+---
 
 ## Short summary
 
