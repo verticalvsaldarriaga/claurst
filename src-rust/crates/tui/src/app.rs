@@ -3497,76 +3497,6 @@ impl App {
             *self.selection_text.borrow_mut() = String::new();
         }
 
-        // ---- Voice hold-to-talk (Alt+V toggles recording on/off) ----------
-        if key.code == KeyCode::Char('v')
-            && key.modifiers.contains(KeyModifiers::ALT)
-            && self.voice_recorder.is_some()
-        {
-            if !self.voice_recording {
-                // First press: start recording.
-                let (tx, rx) = tokio::sync::mpsc::channel(8);
-                self.voice_event_rx = Some(rx);
-                self.voice_recording = true;
-                if let Some(ref recorder_arc) = self.voice_recorder {
-                    let recorder = recorder_arc.clone();
-                    // Use spawn_blocking so we don't hold a std::sync::MutexGuard
-                    // across an await point.  start_recording internally spawns a
-                    // tokio task and returns quickly, so blocking is negligible.
-                    tokio::task::spawn_blocking(move || {
-                        if let Ok(mut r) = recorder.lock() {
-                            // start_recording is async but its real work happens in
-                            // a spawned task; use block_on to drive the short setup.
-                            tokio::runtime::Handle::current()
-                                .block_on(r.start_recording(tx))
-                                .ok();
-                        }
-                    });
-                }
-                self.notifications.push(
-                    NotificationKind::Info,
-                    "Recording\u{2026} (Alt+V to transcribe · Esc to cancel)".to_string(),
-                    None,
-                );
-            } else {
-                // Second press: stop recording.  stop_recording() just flips an
-                // AtomicBool; drive it synchronously to avoid Send issues.
-                self.voice_recording = false;
-                if let Some(ref recorder_arc) = self.voice_recorder {
-                    let recorder = recorder_arc.clone();
-                    tokio::task::spawn_blocking(move || {
-                        if let Ok(mut r) = recorder.lock() {
-                            tokio::runtime::Handle::current()
-                                .block_on(r.stop_recording())
-                                .ok();
-                        }
-                    });
-                }
-                self.notifications.push(
-                    NotificationKind::Info,
-                    "Transcribing\u{2026}".to_string(),
-                    Some(10),
-                );
-            }
-            return false;
-        }
-
-        // ---- Voice PTT: plain V press starts recording when voice is on ----
-        // This is the "hold to talk" variant.  The user presses V to begin
-        // recording; releasing V (handled in the run loop) or pressing Enter
-        // stops the capture and triggers transcription.
-        // Only active when voice mode is enabled (voice_recorder is Some) and
-        // the prompt input is in default (non-vim) mode so 'v' doesn't conflict
-        // with vim keybindings.
-        if key.code == KeyCode::Char('v')
-            && key.modifiers == KeyModifiers::NONE
-            && self.voice_recorder.is_some()
-            && !self.voice_recording
-            && self.prompt_input.vim_mode == crate::prompt_input::VimMode::Insert
-        {
-            self.handle_voice_ptt_start();
-            return false;
-        }
-
         // ---- Ctrl+V — clipboard paste (image first, then text fallback) ----
         // Only fires when NOT in vim Normal/Visual/VisualBlock mode (where \x16 is
         // already consumed by the vim handler above to enter VisualBlock mode).
@@ -3603,12 +3533,27 @@ impl App {
             return false;
         }
 
-        // ---- Enter while PTT recording: stop capture instead of submitting ----
+        // ---- Enter while voice recording: stop capture instead of submitting ----
         if key.code == KeyCode::Enter
             && self.voice_recording
             && self.voice_recorder.is_some()
         {
-            self.handle_voice_ptt_stop();
+            self.voice_recording = false;
+            if let Some(ref recorder_arc) = self.voice_recorder {
+                let recorder = recorder_arc.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(mut r) = recorder.lock() {
+                        tokio::runtime::Handle::current()
+                            .block_on(r.stop_recording())
+                            .ok();
+                    }
+                });
+            }
+            self.notifications.push(
+                NotificationKind::Info,
+                "Transcribing…".to_string(),
+                Some(10),
+            );
             return false;
         }
 
@@ -5480,19 +5425,8 @@ impl App {
                 match event::read()? {
                     Event::Key(key) => {
                         // On Windows crossterm fires both Press and Release events.
-                        // We normally skip non-press events, but when voice PTT mode
-                        // is active we need the Release event for the `V` key so we
-                        // can stop recording as soon as the user lifts the key.
+                        // We normally skip non-press events.
                         if key.kind != crossterm::event::KeyEventKind::Press {
-                            // Handle V-key release to stop PTT recording.
-                            if key.kind == crossterm::event::KeyEventKind::Release
-                                && key.code == KeyCode::Char('v')
-                                && key.modifiers == KeyModifiers::NONE
-                                && self.voice_recording
-                                && self.voice_recorder.is_some()
-                            {
-                                self.handle_voice_ptt_stop();
-                            }
                             continue;
                         }
                         let should_submit = self.handle_key_event(key);
