@@ -1298,6 +1298,7 @@ pub mod config {
                         let Ok(resp) = client
                             .post(crate::oauth::TOKEN_URL)
                             .header("content-type", "application/json")
+                            .header("anthropic-beta", crate::constants::OAUTH_BETA_HEADER)
                             .json(&body)
                             .send()
                             .await else { break 'refresh None; };
