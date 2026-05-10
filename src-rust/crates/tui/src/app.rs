@@ -249,6 +249,7 @@ fn provider_picker_items() -> Vec<SelectItem> {
         SelectItem { id: "groq".into(), title: "Groq".into(), description: "Fast hosted inference".into(), category: "Popular".into(), badge: Some("FREE".into()) },
         SelectItem { id: "ollama".into(), title: "Ollama".into(), description: "Run models locally".into(), category: "Popular".into(), badge: Some("LOCAL".into()) },
         SelectItem { id: "zai".into(), title: "Z.AI".into(), description: "GLM-5.1 / GLM-5 / GLM-4.7 Coding Plan".into(), category: "Popular".into(), badge: None },
+        SelectItem { id: "opencode-go".into(), title: "OpenCode Go".into(), description: "$10/mo flat-rate · Kimi · DeepSeek · GLM · MiniMax".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "cerebras".into(), title: "Cerebras".into(), description: "Fast hosted inference".into(), category: "Other".into(), badge: Some("FREE".into()) },
         SelectItem { id: "sambanova".into(), title: "SambaNova".into(), description: "Fast hosted inference".into(), category: "Other".into(), badge: Some("FREE".into()) },
         SelectItem { id: "lmstudio".into(), title: "LM Studio".into(), description: "Local model server".into(), category: "Other".into(), badge: Some("LOCAL".into()) },
@@ -3497,6 +3498,59 @@ impl App {
             *self.selection_text.borrow_mut() = String::new();
         }
 
+        // ---- Voice hold-to-talk (Alt+V toggles recording on/off) ----------
+        if key.code == KeyCode::Char('v')
+            && key.modifiers.contains(KeyModifiers::ALT)
+            && self.voice_recorder.is_some()
+        {
+            if !self.voice_recording {
+                // First press: start recording.
+                let (tx, rx) = tokio::sync::mpsc::channel(8);
+                self.voice_event_rx = Some(rx);
+                self.voice_recording = true;
+                if let Some(ref recorder_arc) = self.voice_recorder {
+                    let recorder = recorder_arc.clone();
+                    // Use spawn_blocking so we don't hold a std::sync::MutexGuard
+                    // across an await point.  start_recording internally spawns a
+                    // tokio task and returns quickly, so blocking is negligible.
+                    tokio::task::spawn_blocking(move || {
+                        if let Ok(mut r) = recorder.lock() {
+                            // start_recording is async but its real work happens in
+                            // a spawned task; use block_on to drive the short setup.
+                            tokio::runtime::Handle::current()
+                                .block_on(r.start_recording(tx))
+                                .ok();
+                        }
+                    });
+                }
+                self.notifications.push(
+                    NotificationKind::Info,
+                    "Recording\u{2026} (Alt+V to transcribe · Esc to cancel)".to_string(),
+                    None,
+                );
+            } else {
+                // Second press: stop recording.  stop_recording() just flips an
+                // AtomicBool; drive it synchronously to avoid Send issues.
+                self.voice_recording = false;
+                if let Some(ref recorder_arc) = self.voice_recorder {
+                    let recorder = recorder_arc.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if let Ok(mut r) = recorder.lock() {
+                            tokio::runtime::Handle::current()
+                                .block_on(r.stop_recording())
+                                .ok();
+                        }
+                    });
+                }
+                self.notifications.push(
+                    NotificationKind::Info,
+                    "Transcribing\u{2026}".to_string(),
+                    Some(10),
+                );
+            }
+            return false;
+        }
+
         // ---- Ctrl+V — clipboard paste (image first, then text fallback) ----
         // Only fires when NOT in vim Normal/Visual/VisualBlock mode (where \x16 is
         // already consumed by the vim handler above to enter VisualBlock mode).
@@ -3533,27 +3587,12 @@ impl App {
             return false;
         }
 
-        // ---- Enter while voice recording: stop capture instead of submitting ----
+        // ---- Enter while PTT recording: stop capture instead of submitting ----
         if key.code == KeyCode::Enter
             && self.voice_recording
             && self.voice_recorder.is_some()
         {
-            self.voice_recording = false;
-            if let Some(ref recorder_arc) = self.voice_recorder {
-                let recorder = recorder_arc.clone();
-                tokio::task::spawn_blocking(move || {
-                    if let Ok(mut r) = recorder.lock() {
-                        tokio::runtime::Handle::current()
-                            .block_on(r.stop_recording())
-                            .ok();
-                    }
-                });
-            }
-            self.notifications.push(
-                NotificationKind::Info,
-                "Transcribing…".to_string(),
-                Some(10),
-            );
+            self.handle_voice_ptt_stop();
             return false;
         }
 
