@@ -377,6 +377,18 @@ async fn main() -> anyhow::Result<()> {
         return handle_auth_command(&raw_args[2..]).await;
     }
 
+    // Fast-path: `claurst codex <login|logout|list|switch|remove>` — manage
+    // OpenAI Codex (ChatGPT) accounts. Mirrors `claurst auth` for symmetry.
+    if raw_args.get(1).map(|s| s.as_str()) == Some("codex") {
+        return handle_codex_account_command(&raw_args[2..]).await;
+    }
+
+    // Fast-path: `claurst accounts` — list all stored accounts across providers.
+    if raw_args.get(1).map(|s| s.as_str()) == Some("accounts") {
+        handle_accounts_command(&raw_args[2..]);
+        return Ok(());
+    }
+
     // Fast-path: `claurst upgrade [--version <v>] [--force]` — self-update.
     if raw_args.get(1).map(|s| s.as_str()) == Some("upgrade") {
         return upgrade::run_upgrade(&raw_args[2..]).await;
@@ -445,7 +457,10 @@ async fn main() -> anyhow::Result<()> {
     let base_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(log_level));
     let log_filter = base_filter
-        .add_directive("rmcp::service::client=error".parse().expect("valid rmcp directive"));
+        .add_directive("rmcp::service::client=error".parse().expect("valid rmcp directive"))
+        // Suppress error/warn logs from providers and query — errors are already shown as error modals
+        .add_directive("claurst_api::providers::free=off".parse().expect("valid directive"))
+        .add_directive("claurst_query=off".parse().expect("valid directive"));
     tracing_subscriber::fmt()
         .with_env_filter(log_filter)
         .with_target(false)
@@ -1956,7 +1971,7 @@ async fn run_interactive(
         app.notifications.tick();
 
         // Process file injection dialog outcome (if any)
-        if let Some((outcome, pending_input, _pending_imgs)) = app.file_injection_dialog.take_outcome() {
+        if let Some((outcome, pending_input, pending_imgs)) = app.file_injection_dialog.take_outcome() {
             use claurst_tui::FileInjectionOutcome;
 
             if matches!(outcome, FileInjectionOutcome::Abort) {
@@ -1964,9 +1979,14 @@ async fn run_interactive(
                 continue;
             }
 
-            // InjectAll or SkipOversized: restore input to prompt for resubmission
-            // Images attached when dialog was shown are discarded; user can re-attach if needed
+            // InjectAll: bypass size limit on resubmission, restore stashed input+images,
+            // then synthesize Enter to send immediately.
+            app.file_injection_force = true;
+            for img in pending_imgs {
+                app.prompt_input.add_image(img);
+            }
             app.set_prompt_text(pending_input);
+            app.pending_auto_submit = true;
         }
 
         // Draw the UI
@@ -2012,38 +2032,7 @@ async fn run_interactive(
 
                     // Enter => submit input (but NOT when ANY dialog/overlay is open —
                     // dialogs handle their own Enter in handle_key_event).
-                    let any_dialog_open = app.connect_dialog.visible
-                        || app.import_config_picker.visible
-                        || app.import_config_dialog.visible
-                        || app.key_input_dialog.visible
-                        || app.custom_provider_dialog.visible
-                        || app.device_auth_dialog.visible
-                        || app.command_palette.visible
-                        || app.model_picker.visible
-                        || app.onboarding_dialog.visible
-                        || app.bypass_permissions_dialog.visible
-                        || app.file_injection_dialog.visible
-                        || app.ask_user_dialog.visible
-                        || app.settings_screen.visible
-                        || app.export_dialog.visible
-                        || app.theme_screen.visible
-                        || app.stats_dialog.open
-                        || app.invalid_config_dialog.visible
-                        || app.context_viz.visible
-                        || app.mcp_approval.visible
-                        || app.session_browser.visible
-                        || app.session_branching.visible
-                        || app.tasks_overlay.visible
-                        || app.mcp_view.open
-                        || app.agents_menu.open
-                        || app.diff_viewer.open
-                        || app.help_overlay.visible
-                        || app.history_search_overlay.visible
-                        || app.rewind_flow.visible
-                        || app.show_help
-                        || app.context_menu_state.is_some()
-                        || app.permission_request.is_some()
-                        || app.global_search.open;
+                    let any_dialog_open = app.any_modal_open();
                     if key.code == KeyCode::Enter && app.is_streaming && !any_dialog_open {
                         // Queue the message: it will auto-submit once the
                         // current turn finishes (issue #149).
@@ -2061,6 +2050,18 @@ async fn run_interactive(
                         continue;
                     }
                     if key.code == KeyCode::Enter && !app.is_streaming && !any_dialog_open {
+                        // If a file-ref suggestion is active, accept it instead of submitting.
+                        if !app.prompt_input.suggestions.is_empty()
+                            && app.prompt_input.suggestion_index.is_some()
+                            && app.prompt_input.suggestions.get(app.prompt_input.suggestion_index.unwrap())
+                                .map(|s| s.source == claurst_tui::prompt_input::TypeaheadSource::FileRef)
+                                .unwrap_or(false)
+                        {
+                            app.prompt_input.accept_suggestion();
+                            app.prompt_input.insert_char(' ');
+                            app.refresh_prompt_input();
+                            continue;
+                        }
                         // If a slash-command suggestion is active, accept and execute immediately.
                         if !app.prompt_input.suggestions.is_empty()
                             && app.prompt_input.suggestion_index.is_some()
@@ -2376,6 +2377,71 @@ async fn run_interactive(
                                     }
                                     terminal = claurst_tui::setup_terminal()?;
                                 }
+                                Some(CommandResult::StartLoginForProvider {
+                                    provider,
+                                    login_with_claude_ai,
+                                    label,
+                                }) => {
+                                    claurst_tui::restore_terminal(&mut terminal).ok();
+                                    if provider == claurst_core::accounts::PROVIDER_CODEX {
+                                        let (tx, mut rx) = tokio::sync::mpsc::channel::<
+                                            claurst_tui::DeviceAuthEvent,
+                                        >(8);
+                                        tokio::spawn(async move {
+                                            while let Some(evt) = rx.recv().await {
+                                                if let claurst_tui::DeviceAuthEvent::GotBrowserUrl {
+                                                    url,
+                                                } = evt
+                                                {
+                                                    eprintln!(
+                                                        "\nOpening browser for Codex \
+                                                         authentication...\nIf the browser \
+                                                         did not open, visit:\n\n  {}\n",
+                                                        url
+                                                    );
+                                                }
+                                            }
+                                        });
+                                        match crate::codex_oauth_flow::run_oauth_flow_with_label(
+                                            tx,
+                                            label.as_deref(),
+                                        )
+                                        .await
+                                        {
+                                            Ok(_) => {
+                                                app.status_message = Some(
+                                                    "Codex login successful!".to_string(),
+                                                );
+                                                eprintln!("\nCodex login successful!");
+                                                break 'main;
+                                            }
+                                            Err(e) => {
+                                                eprintln!("\nCodex login failed: {}", e);
+                                            }
+                                        }
+                                    } else {
+                                        match oauth_flow::run_oauth_login_flow_with_label(
+                                            login_with_claude_ai,
+                                            label.as_deref(),
+                                        )
+                                        .await
+                                        {
+                                            Ok(_) => {
+                                                app.status_message =
+                                                    Some("Login successful!".to_string());
+                                                eprintln!(
+                                                    "\nLogin successful! Please restart \
+                                                     claurst to use the new credentials."
+                                                );
+                                                break 'main;
+                                            }
+                                            Err(e) => {
+                                                eprintln!("\nLogin failed: {}", e);
+                                            }
+                                        }
+                                    }
+                                    terminal = claurst_tui::setup_terminal()?;
+                                }
                                 Some(CommandResult::Error(e)) => {
                                     app.status_message = Some(format!("Error: {}", e));
                                 }
@@ -2439,7 +2505,7 @@ async fn run_interactive(
                         }
 
                         // Fire UserPromptSubmit hook (non-blocking)
-                        if !config.hooks.is_empty() {
+                        if !cmd_ctx.config.hooks.is_empty() {
                             let hook_ctx = claurst_core::hooks::HookContext {
                                 event: "UserPromptSubmit".to_string(),
                                 tool_name: None,
@@ -2449,7 +2515,7 @@ async fn run_interactive(
                                 session_id: Some(tool_ctx.session_id.clone()),
                             };
                             claurst_core::hooks::run_hooks(
-                                &config.hooks,
+                                &cmd_ctx.config.hooks,
                                 claurst_core::config::HookEvent::UserPromptSubmit,
                                 &hook_ctx,
                                 &tool_ctx.working_dir,
@@ -2461,27 +2527,46 @@ async fn run_interactive(
                         let pending_imgs = app.prompt_input.clear_images();
 
                         // Check for file injection if enabled
-                        if config.file_injection_enabled {
+                        if app.config.file_injection_enabled {
                             use claurst_tui::file_injection::parse_at_refs;
 
-                            let (within_limit, oversized) = parse_at_refs(&input, &tool_ctx.working_dir, config.file_injection_max_size);
+                            // file_injection_force is set when user chose "inject anyways" in the
+                            // warning dialog — pass limit 0 so all files are treated as within
+                            // limit. Also drop any directory refs silently on force re-submit so
+                            // they don't loop back to the directory warning.
+                            let was_force = app.file_injection_force;
+                            let effective_limit = if app.file_injection_force {
+                                app.file_injection_force = false;
+                                0
+                            } else {
+                                app.config.file_injection_max_size
+                            };
+                            let (within_limit, mut oversized) = parse_at_refs(&input, &tool_ctx.working_dir, effective_limit);
+                            if was_force {
+                                oversized.retain(|f| !matches!(f.issue, Some(claurst_tui::AtFileIssue::IsDirectory)));
+                            }
 
                             if !oversized.is_empty() {
-                                // Show dialog with oversized files
-                                let oversized_summaries: Vec<(String, usize, String)> = oversized
+                                // Show either the directory warning or the file warning, never both.
+                                // Directories take precedence: if any are present, show only those.
+                                let has_dirs = oversized.iter().any(|f| matches!(f.issue, Some(claurst_tui::AtFileIssue::IsDirectory)));
+                                let oversized_summaries: Vec<(String, usize, claurst_tui::AtFileIssue)> = oversized
                                     .iter()
-                                    .map(|f| {
-                                        let issue_str = match &f.issue {
-                                            Some(claurst_tui::AtFileIssue::TooLarge(kb)) => format!("TooLarge: {} KB", kb),
-                                            Some(claurst_tui::AtFileIssue::Binary) => "Binary".to_string(),
-                                            Some(claurst_tui::AtFileIssue::Unreadable(e)) => e.clone(),
-                                            None => "Unknown".to_string(),
-                                        };
-                                        (f.path.display().to_string(), f.size_kb, issue_str)
+                                    .filter(|f| {
+                                        let is_dir = matches!(f.issue, Some(claurst_tui::AtFileIssue::IsDirectory));
+                                        if has_dirs { is_dir } else { !is_dir }
                                     })
+                                    .filter_map(|f| f.issue.clone().map(|issue| (f.path.display().to_string(), f.size_kb, issue)))
                                     .collect();
 
-                                app.file_injection_dialog.show(input.clone(), pending_imgs, oversized_summaries);
+                                app.file_injection_dialog.show(
+                                    input.clone(),
+                                    pending_imgs,
+                                    oversized_summaries,
+                                    app.config.file_injection_max_size,
+                                    Some(tool_ctx.working_dir.clone()),
+                                );
+                                app.set_prompt_text(input);
                                 continue;
                             }
 
@@ -3496,8 +3581,17 @@ async fn run_interactive(
 
         if task_finished {
             if let Some((handle, msgs_arc)) = current_query.take() {
-                // Get the outcome (ignore errors for now)
-                let _ = handle.await;
+                // Get the outcome and handle errors
+                if let Ok(QueryOutcome::Error(err)) = handle.await {
+                    while app.notifications.current_is_error() {
+                        app.notifications.dismiss_current();
+                    }
+                    app.notifications.push(
+                        claurst_tui::notifications::NotificationKind::Error,
+                        err.to_string(),
+                        None,
+                    );
+                }
                 // Sync the updated conversation back to our local vector
                 messages = msgs_arc.lock().await.clone();
                 session.messages = messages.clone();
@@ -3711,7 +3805,7 @@ async fn run_interactive(
             tool_ctx.mcp_manager = new_mcp_manager.clone();
             app.mcp_manager = new_mcp_manager.clone();
             tools_arc = build_tools_with_mcp(new_mcp_manager.clone());
-            if app.mcp_view.open {
+            if app.mcp_view.visible {
                 app.refresh_mcp_view();
             }
 
@@ -3759,8 +3853,14 @@ async fn handle_auth_command(args: &[String]) -> anyhow::Result<()> {
             // --console flag selects the Console OAuth flow (creates an API key)
             // Default (no flag) uses the Claude.ai flow (Bearer token)
             let login_with_claude_ai = !args.iter().any(|a| a == "--console");
+            let label = extract_label_flag(args);
             println!("Starting authentication...");
-            match oauth_flow::run_oauth_login_flow(login_with_claude_ai).await {
+            match oauth_flow::run_oauth_login_flow_with_label(
+                login_with_claude_ai,
+                label.as_deref(),
+            )
+            .await
+            {
                 Ok(result) => {
                     println!("Successfully logged in!");
                     if let Some(email) = &result.tokens.email {
@@ -3770,6 +3870,11 @@ async fn handle_auth_command(args: &[String]) -> anyhow::Result<()> {
                         println!("  Auth method: claude.ai");
                     } else {
                         println!("  Auth method: console (API key)");
+                    }
+                    if let Some(active) = claurst_core::accounts::AccountRegistry::load()
+                        .active(claurst_core::accounts::PROVIDER_ANTHROPIC)
+                    {
+                        println!("  Profile: {}", active);
                     }
                     std::process::exit(0);
                 }
@@ -3789,26 +3894,269 @@ async fn handle_auth_command(args: &[String]) -> anyhow::Result<()> {
             auth_status(json_output).await;
         }
 
+        Some("list") | Some("ls") | Some("accounts") => {
+            print_account_list(claurst_core::accounts::PROVIDER_ANTHROPIC, "Anthropic");
+            std::process::exit(0);
+        }
+
+        Some("switch") | Some("use") => {
+            let id = args.get(1).map(|s| s.as_str());
+            switch_account(claurst_core::accounts::PROVIDER_ANTHROPIC, "Anthropic", id);
+        }
+
+        Some("remove") | Some("rm") => {
+            let id = args.get(1).map(|s| s.as_str()).unwrap_or_else(|| {
+                eprintln!("Usage: claurst auth remove <profile-id>");
+                std::process::exit(1);
+            });
+            remove_account(claurst_core::accounts::PROVIDER_ANTHROPIC, "Anthropic", id);
+        }
+
         Some(unknown) => {
             eprintln!("Unknown auth subcommand: '{}'", unknown);
             eprintln!();
-            eprintln!("Usage: claurst auth <subcommand>");
-            eprintln!("  login [--console]   Authenticate (claude.ai by default; --console for API key)");
-            eprintln!("  logout              Remove stored credentials");
-            eprintln!("  status [--json]     Show authentication status");
+            print_auth_usage();
             std::process::exit(1);
         }
 
         None => {
-            eprintln!("Usage: claurst auth <login|logout|status>");
-            eprintln!("  login [--console]   Authenticate with Anthropic");
-            eprintln!("  logout              Remove stored credentials");
-            eprintln!("  status [--json]     Show authentication status");
+            print_auth_usage();
             std::process::exit(1);
         }
     }
 
     Ok(())
+}
+
+fn print_auth_usage() {
+    eprintln!("Usage: claurst auth <subcommand>");
+    eprintln!("  login [--console] [--label <name>]   Authenticate (claude.ai by default)");
+    eprintln!("  logout                                Remove the active account's credentials");
+    eprintln!("  status [--json]                       Show authentication status");
+    eprintln!("  list                                  List all stored Anthropic accounts");
+    eprintln!("  switch <profile-id>                   Make a stored account active");
+    eprintln!("  remove <profile-id>                   Delete a stored account");
+}
+
+fn extract_label_flag(args: &[String]) -> Option<String> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--label" || a == "-l" {
+            return it.next().cloned();
+        }
+        if let Some(rest) = a.strip_prefix("--label=") {
+            return Some(rest.to_string());
+        }
+    }
+    None
+}
+
+fn print_account_list(provider: &str, display_name: &str) {
+    let registry = claurst_core::accounts::AccountRegistry::load();
+    let profiles = registry.list(provider);
+    let active = registry.active(provider).map(String::from);
+    if profiles.is_empty() {
+        println!("No {} accounts stored.", display_name);
+        println!("Use `claurst {} login` to add one.",
+            if provider == "anthropic" { "auth" } else { provider });
+        return;
+    }
+    println!("{} accounts:", display_name);
+    for p in profiles {
+        let marker = if active.as_deref() == Some(&p.id) { "*" } else { " " };
+        let email = p.email.as_deref().unwrap_or("");
+        let label = p
+            .label
+            .as_deref()
+            .map(|l| format!(" ({})", l))
+            .unwrap_or_default();
+        let tier = p
+            .subscription_tier
+            .as_deref()
+            .map(|t| format!(" [{}]", t))
+            .unwrap_or_default();
+        println!("  {} {}{}{}  {}", marker, p.id, label, tier, email);
+    }
+}
+
+fn switch_account(provider: &str, display_name: &str, id: Option<&str>) -> ! {
+    let mut registry = claurst_core::accounts::AccountRegistry::load();
+    let profiles = registry.list(provider);
+
+    let target = match id {
+        Some(id) => id.to_string(),
+        None => {
+            if profiles.is_empty() {
+                eprintln!("No {} accounts stored.", display_name);
+                std::process::exit(1);
+            }
+            // No id: print the picker and exit with usage.
+            eprintln!("Usage: claurst {} switch <profile-id>",
+                if provider == "anthropic" { "auth" } else { provider });
+            eprintln!();
+            print_account_list(provider, display_name);
+            std::process::exit(1);
+        }
+    };
+
+    match registry.switch_to(provider, &target) {
+        Ok(()) => {
+            println!("Switched {} active account to '{}'.", display_name, target);
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("{}", e);
+            eprintln!();
+            print_account_list(provider, display_name);
+            std::process::exit(1);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `claurst codex` subcommand handler (account-level CLI)
+// ---------------------------------------------------------------------------
+
+async fn handle_codex_account_command(args: &[String]) -> anyhow::Result<()> {
+    match args.first().map(|s| s.as_str()) {
+        Some("login") => {
+            let label = extract_label_flag(args);
+            // The Codex flow expects a TUI DeviceAuth dialog. For headless CLI
+            // login we still spin up the OAuth listener but route the URL
+            // through a no-op channel; the user opens the URL in their browser
+            // either way.
+            let (tx, mut rx) =
+                tokio::sync::mpsc::channel::<claurst_tui::DeviceAuthEvent>(8);
+            tokio::spawn(async move {
+                while let Some(evt) = rx.recv().await {
+                    if let claurst_tui::DeviceAuthEvent::GotBrowserUrl { url } = evt {
+                        println!("Opening browser for Codex authentication...");
+                        println!(
+                            "If the browser did not open, visit:\n\n  {}\n",
+                            url
+                        );
+                    }
+                }
+            });
+            match crate::codex_oauth_flow::run_oauth_flow_with_label(tx, label.as_deref()).await
+            {
+                Ok(_) => {
+                    let registry = claurst_core::accounts::AccountRegistry::load();
+                    println!("Successfully logged in to Codex!");
+                    if let Some(p) = registry.active_profile(claurst_core::accounts::PROVIDER_CODEX) {
+                        if let Some(email) = &p.email {
+                            println!("  Account: {}", email);
+                        }
+                        println!("  Profile: {}", p.id);
+                    }
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("Codex login failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("logout") => {
+            match claurst_core::oauth_config::clear_codex_tokens() {
+                Ok(_) => {
+                    println!("Logged out of the active Codex account.");
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("Logout failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("list") | Some("ls") | Some("accounts") => {
+            print_account_list(claurst_core::accounts::PROVIDER_CODEX, "Codex");
+            std::process::exit(0);
+        }
+        Some("switch") | Some("use") => {
+            let id = args.get(1).map(|s| s.as_str());
+            switch_account(claurst_core::accounts::PROVIDER_CODEX, "Codex", id);
+        }
+        Some("remove") | Some("rm") => {
+            let id = args.get(1).map(|s| s.as_str()).unwrap_or_else(|| {
+                eprintln!("Usage: claurst codex remove <profile-id>");
+                std::process::exit(1);
+            });
+            remove_account(claurst_core::accounts::PROVIDER_CODEX, "Codex", id);
+        }
+        Some("status") => {
+            let registry = claurst_core::accounts::AccountRegistry::load();
+            match registry.active_profile(claurst_core::accounts::PROVIDER_CODEX) {
+                Some(p) => {
+                    println!("Logged in to Codex.");
+                    println!("  Profile: {}", p.id);
+                    if let Some(email) = &p.email {
+                        println!("  Account: {}", email);
+                    }
+                    std::process::exit(0);
+                }
+                None => {
+                    println!("Not logged in to Codex.");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(unknown) => {
+            eprintln!("Unknown codex subcommand: '{}'", unknown);
+            eprintln!();
+            print_codex_usage();
+            std::process::exit(1);
+        }
+        None => {
+            print_codex_usage();
+            std::process::exit(1);
+        }
+    }
+}
+
+fn print_codex_usage() {
+    eprintln!("Usage: claurst codex <subcommand>");
+    eprintln!("  login [--label <name>]   Authenticate with ChatGPT/Codex");
+    eprintln!("  logout                   Remove the active Codex credentials");
+    eprintln!("  status                   Show Codex auth status");
+    eprintln!("  list                     List all stored Codex accounts");
+    eprintln!("  switch <profile-id>      Make a stored Codex account active");
+    eprintln!("  remove <profile-id>      Delete a stored Codex account");
+}
+
+// ---------------------------------------------------------------------------
+// `claurst accounts` — unified read-only list across providers
+// ---------------------------------------------------------------------------
+
+fn handle_accounts_command(args: &[String]) {
+    if args.iter().any(|a| a == "--json") {
+        let registry = claurst_core::accounts::AccountRegistry::load();
+        let json = serde_json::to_string_pretty(&registry).unwrap_or_else(|_| "{}".into());
+        println!("{}", json);
+        return;
+    }
+
+    print_account_list(claurst_core::accounts::PROVIDER_ANTHROPIC, "Anthropic");
+    println!();
+    print_account_list(claurst_core::accounts::PROVIDER_CODEX, "Codex");
+}
+
+fn remove_account(provider: &str, display_name: &str, id: &str) -> ! {
+    let mut registry = claurst_core::accounts::AccountRegistry::load();
+    if registry.get(provider, id).is_none() {
+        eprintln!("No {} account '{}' to remove.", display_name, id);
+        std::process::exit(1);
+    }
+    match registry.remove(provider, id) {
+        Ok(()) => {
+            println!("Removed {} account '{}'.", display_name, id);
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("Failed to remove account: {}", e);
+            std::process::exit(1);
+        }
+    }
 }
 
 fn provider_status_lookup_keys(provider_id: &str) -> Vec<&str> {

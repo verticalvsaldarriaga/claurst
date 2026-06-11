@@ -34,6 +34,8 @@ pub mod format_utils;
 pub mod crypto_utils;
 pub mod status_notices;
 pub mod auto_mode;
+pub mod spinner;
+pub use spinner::{SPINNER_VERBS, TURN_COMPLETION_VERBS, sample_spinner_verb, sample_completion_verb};
 
 // Remote session sync and cloud session API (T3-1, T3-2).
 pub mod remote_session;
@@ -1277,7 +1279,6 @@ pub mod config {
         }
 
 
-
         /// Resolve the effective max-tokens.
         pub fn effective_max_tokens(&self) -> u32 {
             self.max_tokens
@@ -1523,11 +1524,22 @@ pub mod config {
                     config.skills.urls.push(u.clone());
                 }
             }
-            // Copy file autocomplete and injection settings.
-            config.file_autocomplete_limit = self.file_autocomplete_limit;
-            config.file_autocomplete_show_hidden_files = self.file_autocomplete_show_hidden_files;
-            config.file_injection_enabled = self.file_injection_enabled;
-            config.file_injection_max_size = self.file_injection_max_size;
+            // Copy file autocomplete and injection settings from the top-level Settings
+            // fields, but only when they were explicitly set (differ from their defaults).
+            // If they're at defaults, the nested "config" section value (already in `config`
+            // via the clone above) takes precedence.
+            if self.file_autocomplete_limit != default_file_autocomplete_limit() {
+                config.file_autocomplete_limit = self.file_autocomplete_limit;
+            }
+            if self.file_autocomplete_show_hidden_files {
+                config.file_autocomplete_show_hidden_files = true;
+            }
+            if self.file_injection_enabled != default_true() {
+                config.file_injection_enabled = self.file_injection_enabled;
+            }
+            if self.file_injection_max_size != default_file_injection_max_size() {
+                config.file_injection_max_size = self.file_injection_max_size;
+            }
             config
         }
 
@@ -3170,8 +3182,36 @@ pub mod cost {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
+    /// Free upstream provider IDs used in the free provider system.
+    ///
+    /// These overlap with providers that appear in `api_key_env_vars_for_provider`.
+    /// When adding a provider to one, check whether it also belongs in the other.
+    const FREE_UPSTREAM_IDS: &[&str] = &[
+        "groq",
+        "cerebras",
+        "google",
+        "mistral",
+        "sambanova",
+        "nvidia",
+        "cohere",
+        "openrouter",
+        "opencode-zen",
+        "zai",
+        "zhipuai",
+    ];
+
+    /// Check if a model name is an upstream-prefixed free model (e.g., "groq/llama-3.3-70b-versatile").
+    fn is_free_upstream_model(model: &str) -> bool {
+        for upstream_id in FREE_UPSTREAM_IDS {
+            if model.starts_with(&format!("{}/", upstream_id)) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Per-model pricing tiers (USD per million tokens).
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone, Copy, PartialEq)]
     pub struct ModelPricing {
         pub input_per_mtk: f64,
         pub output_per_mtk: f64,
@@ -3204,6 +3244,14 @@ pub mod cost {
             cache_read_per_mtk: 0.08,
         };
 
+        /// Free model pricing (no cost).
+        pub const FREE: Self = Self {
+            input_per_mtk: 0.0,
+            output_per_mtk: 0.0,
+            cache_creation_per_mtk: 0.0,
+            cache_read_per_mtk: 0.0,
+        };
+
         /// Default pricing is Opus (most capable, highest cost).
         pub fn default_pricing() -> Self {
             Self::OPUS
@@ -3211,7 +3259,12 @@ pub mod cost {
 
         /// Pick pricing based on model name substring matching.
         pub fn for_model(model: &str) -> Self {
-            if model.contains("opus") {
+            // Check for free models first (those with "-free" suffix, "free/" prefix, or upstream-prefixed free model)
+            if model.ends_with("-free") || model.starts_with("free/") {
+                Self::FREE
+            } else if is_free_upstream_model(model) {
+                Self::FREE
+            } else if model.contains("opus") {
                 Self::OPUS
             } else if model.contains("haiku") {
                 Self::HAIKU
@@ -3314,7 +3367,9 @@ pub mod cost {
         pub fn summary(&self) -> String {
             let cost = self.total_cost_usd();
             let total = self.total_tokens();
-            if cost < 0.01 {
+            if cost == 0.0 {
+                format!("{} tokens ($0.00)", total)
+            } else if cost < 0.01 {
                 format!("{} tokens (<$0.01)", total)
             } else {
                 format!("{} tokens (${:.2})", total, cost)
@@ -3545,6 +3600,8 @@ pub mod oauth {
             }
         }
 
+        /// Legacy token file path — kept for backward-compat reads when no
+        /// account registry exists yet. New writes go to per-account dirs.
         pub fn token_file_path() -> std::path::PathBuf {
             dirs::home_dir()
                 .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -3552,8 +3609,10 @@ pub mod oauth {
                 .join("oauth_tokens.json")
         }
 
-        pub async fn save(&self) -> anyhow::Result<()> {
-            let path = Self::token_file_path();
+        /// Save tokens for a specific account profile under
+        /// `~/.claurst/accounts/anthropic/<profile_id>/oauth_tokens.json`.
+        pub async fn save_for_profile(&self, profile_id: &str) -> anyhow::Result<()> {
+            let path = crate::accounts::anthropic_token_path(profile_id);
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
@@ -3561,8 +3620,9 @@ pub mod oauth {
             Ok(())
         }
 
-        pub async fn load() -> Option<Self> {
-            let path = Self::token_file_path();
+        /// Load tokens for a specific account profile, or `None` if missing.
+        pub async fn load_for_profile(profile_id: &str) -> Option<Self> {
+            let path = crate::accounts::anthropic_token_path(profile_id);
             let content = tokio::fs::read_to_string(&path).await.ok()?;
             serde_json::from_str(&content).ok()
         }
@@ -3621,10 +3681,112 @@ pub mod oauth {
             Some(refreshed)
         }
 
+        /// Save these tokens, register/refresh a profile in the account
+        /// registry, and mark it active. Returns the profile id used.
+        ///
+        /// If `label` is None, derives the id from email/account_uuid.
+        pub async fn save_and_register(&self, label: Option<&str>) -> anyhow::Result<String> {
+            use crate::accounts::{
+                AccountProfile, AccountRegistry, ensure_unique_profile_id,
+                slugify_profile_id, PROVIDER_ANTHROPIC,
+            };
+
+            let mut registry = AccountRegistry::load();
+
+            // Identity-aware id resolution: if a profile with the same email
+            // or account_uuid already exists, reuse it instead of stacking
+            // duplicates.
+            let existing_id = registry
+                .list(PROVIDER_ANTHROPIC)
+                .into_iter()
+                .find(|p| {
+                    (self.email.is_some() && p.email == self.email)
+                        || (self.account_uuid.is_some()
+                            && p.account_id == self.account_uuid)
+                })
+                .map(|p| p.id);
+
+            let id = if let Some(id) = existing_id {
+                id
+            } else if let Some(label) = label {
+                ensure_unique_profile_id(&registry, PROVIDER_ANTHROPIC, label)
+            } else {
+                let base = self
+                    .email
+                    .as_deref()
+                    .map(|e| e.split('@').next().unwrap_or(e).to_string())
+                    .or_else(|| self.account_uuid.clone())
+                    .unwrap_or_else(|| "account".to_string());
+                ensure_unique_profile_id(&registry, PROVIDER_ANTHROPIC, &base)
+            };
+
+            self.save_for_profile(&id).await?;
+
+            let profile = AccountProfile {
+                id: id.clone(),
+                label: label.map(|l| slugify_profile_id(l)),
+                email: self.email.clone(),
+                account_id: self.account_uuid.clone(),
+                organization_uuid: self.organization_uuid.clone(),
+                subscription_tier: self.subscription_type.clone(),
+                added_at: None,
+                last_selected_at: None,
+            };
+            registry.upsert(PROVIDER_ANTHROPIC, profile, true)?;
+            Ok(id)
+        }
+
+        /// Save (active profile, or new profile if registry empty) — back-compat
+        /// shim for callers that don't think in terms of profiles.
+        pub async fn save(&self) -> anyhow::Result<()> {
+            let registry = crate::accounts::AccountRegistry::load();
+            if let Some(active) = registry.active(crate::accounts::PROVIDER_ANTHROPIC) {
+                self.save_for_profile(active).await
+            } else {
+                // No registry yet — register as a new profile.
+                self.save_and_register(None).await.map(|_| ())
+            }
+        }
+
+        /// Load tokens for the active anthropic profile. Falls back to the
+        /// legacy `~/.claurst/oauth_tokens.json` (auto-migrating it into a
+        /// "default" profile on first read) if no registry exists.
+        pub async fn load() -> Option<Self> {
+            let mut registry = crate::accounts::AccountRegistry::load();
+
+            if let Some(active) = registry.active(crate::accounts::PROVIDER_ANTHROPIC) {
+                if let Some(t) = Self::load_for_profile(active).await {
+                    return Some(t);
+                }
+            }
+
+            // Fallback: legacy single-file storage. Migrate on the spot.
+            let legacy = Self::token_file_path();
+            if legacy.exists() {
+                let content = tokio::fs::read_to_string(&legacy).await.ok()?;
+                let tokens: Self = serde_json::from_str(&content).ok()?;
+                // Best-effort migration: register under a derived id.
+                if let Ok(id) = tokens.save_and_register(None).await {
+                    let _ = tokio::fs::remove_file(&legacy).await;
+                    // refresh active pointer
+                    let _ = registry.switch_to(crate::accounts::PROVIDER_ANTHROPIC, &id);
+                }
+                return Some(tokens);
+            }
+            None
+        }
+
+        /// Clear credentials for the active profile (or all credentials if
+        /// `purge_all` is true) and drop the profile from the registry.
         pub async fn clear() -> anyhow::Result<()> {
-            let path = Self::token_file_path();
-            if path.exists() {
-                tokio::fs::remove_file(&path).await?;
+            let mut registry = crate::accounts::AccountRegistry::load();
+            if let Some(active) = registry.active(crate::accounts::PROVIDER_ANTHROPIC).map(String::from) {
+                registry.remove(crate::accounts::PROVIDER_ANTHROPIC, &active)?;
+            }
+            // Also remove any legacy file.
+            let legacy = Self::token_file_path();
+            if legacy.exists() {
+                tokio::fs::remove_file(&legacy).await?;
             }
             Ok(())
         }
@@ -3692,6 +3854,46 @@ pub mod oauth {
         }
         u.to_string()
     }
+
+    /// Active OAuth account `(account_uuid, has_premium)` from
+    /// `/api/oauth/profile`. `has_premium` (Claude Max or extra-usage) gates the
+    /// `context-1m` / `mid-conversation-system` betas. Falls back to the token's
+    /// stored `account_uuid` if the profile call fails; `None` if no token.
+    pub async fn current_anthropic_account_meta() -> Option<(String, bool)> {
+        let tokens = OAuthTokens::load().await?;
+        let token = tokens.access_token.clone();
+        let stored_uuid = tokens.account_uuid.clone();
+
+        let fetched = async {
+            let cfg = crate::oauth_config::get_oauth_config();
+            let url = format!("{}/api/oauth/profile", cfg.base_api_url);
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .ok()?;
+            let resp = client
+                .get(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .header("anthropic-beta", "oauth-2025-04-20")
+                .header("content-type", "application/json")
+                .send()
+                .await
+                .ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            let v: serde_json::Value = resp.json().await.ok()?;
+            let uuid = v["account"]["uuid"].as_str()?.to_string();
+            let has_max = v["account"]["has_claude_max"].as_bool().unwrap_or(false);
+            let has_extra = v["organization"]["has_extra_usage_enabled"]
+                .as_bool()
+                .unwrap_or(false);
+            Some((uuid, has_max || has_extra))
+        }
+        .await;
+
+        fetched.or_else(|| stored_uuid.map(|u| (u, false)))
+    }
 }
 
 // Re-export OAuthTokens at crate root for convenience
@@ -3712,6 +3914,7 @@ pub mod system_prompt;
 pub mod memdir;
 pub mod oauth_config;
 pub mod codex_oauth;
+pub mod accounts;
 pub mod migrations;
 pub mod output_styles;
 pub mod feature_gates;
@@ -4350,6 +4553,43 @@ mod tests {
         assert_eq!(tracker.input_tokens(), 0);
         assert_eq!(tracker.output_tokens(), 0);
         assert_eq!(tracker.total_cost_usd(), 0.0);
+    }
+
+    #[test]
+    fn test_cost_tracker_free_model() {
+        let tracker = CostTracker::with_model("deepseek-v4-flash-free");
+        tracker.add_usage(1000, 500, 200, 100);
+        // Free models should have zero cost even with token usage
+        assert_eq!(tracker.total_cost_usd(), 0.0);
+    }
+
+    #[test]
+    fn test_model_pricing_free_variants() {
+        // Test that models ending with -free use FREE pricing
+        assert_eq!(cost::ModelPricing::for_model("deepseek-v4-flash-free"), cost::ModelPricing::FREE);
+        assert_eq!(cost::ModelPricing::for_model("zen/minimax-m2.5-free"), cost::ModelPricing::FREE);
+
+        // Test that models starting with free/ use FREE pricing
+        assert_eq!(cost::ModelPricing::for_model("free/auto"), cost::ModelPricing::FREE);
+        assert_eq!(cost::ModelPricing::for_model("free/some-model"), cost::ModelPricing::FREE);
+
+        // Test that upstream-prefixed free models use FREE pricing
+        assert_eq!(cost::ModelPricing::for_model("groq/llama-3.3-70b-versatile"), cost::ModelPricing::FREE);
+        assert_eq!(cost::ModelPricing::for_model("cerebras/qwen-3-235b-a22b-instruct-2507"), cost::ModelPricing::FREE);
+        assert_eq!(cost::ModelPricing::for_model("google/gemini-2.5-flash"), cost::ModelPricing::FREE);
+        assert_eq!(cost::ModelPricing::for_model("mistral/mistral-large-latest"), cost::ModelPricing::FREE);
+        assert_eq!(cost::ModelPricing::for_model("sambanova/Meta-Llama-3.3-70B-Instruct"), cost::ModelPricing::FREE);
+        assert_eq!(cost::ModelPricing::for_model("nvidia/meta/llama-3.3-70b-instruct"), cost::ModelPricing::FREE);
+        assert_eq!(cost::ModelPricing::for_model("cohere/command-r-plus"), cost::ModelPricing::FREE);
+        assert_eq!(cost::ModelPricing::for_model("openrouter/free"), cost::ModelPricing::FREE);
+        assert_eq!(cost::ModelPricing::for_model("opencode-zen/minimax-m2.5-free"), cost::ModelPricing::FREE);
+        assert_eq!(cost::ModelPricing::for_model("zai/glm-4.6"), cost::ModelPricing::FREE);
+        assert_eq!(cost::ModelPricing::for_model("zhipuai/glm-4.5"), cost::ModelPricing::FREE);
+
+        // Test that other models use their appropriate pricing
+        assert_eq!(cost::ModelPricing::for_model("claude-opus"), cost::ModelPricing::OPUS);
+        assert_eq!(cost::ModelPricing::for_model("claude-haiku"), cost::ModelPricing::HAIKU);
+        assert_eq!(cost::ModelPricing::for_model("claude-sonnet"), cost::ModelPricing::SONNET);
     }
 
     #[test]
