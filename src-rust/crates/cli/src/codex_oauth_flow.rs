@@ -220,26 +220,33 @@ async fn exchange_code_for_tokens(code: &str, verifier: &str) -> anyhow::Result<
     }
 
     let refresh_token = body["refresh_token"].as_str().map(|s| s.to_string());
-    let account_id = extract_account_id_from_jwt(&access_token);
+    let id_token = body["id_token"].as_str().map(|s| s.to_string());
+    // Prefer account_id from id_token (has chatgpt_account_id claim); fall back to access_token.
+    let account_id = id_token
+        .as_deref()
+        .and_then(extract_account_id_from_jwt)
+        .or_else(|| extract_account_id_from_jwt(&access_token));
 
     Ok(CodexTokens {
         access_token,
+        id_token,
         refresh_token,
         account_id,
         expires_at: None,
     })
 }
 
-/// Extract chatgpt-account-id from the JWT access token.
-/// The account_id is in the middle segment (payload) under
-/// https://api.openai.com/auth.account_id
+/// Extract chatgpt-account-id from a JWT (id_token preferred, access_token fallback).
+/// Checks chatgpt_account_id first (id_token claim), then account_id (access_token claim).
 fn extract_account_id_from_jwt(token: &str) -> Option<String> {
     let parts: Vec<&str> = token.splitn(3, '.').collect();
     let payload_b64 = parts.get(1)?;
     let payload = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
     let json: serde_json::Value = serde_json::from_slice(&payload).ok()?;
-    json["https://api.openai.com/auth"]["account_id"]
-        .as_str()
+    let auth = json.get("https://api.openai.com/auth")?;
+    auth.get("chatgpt_account_id")
+        .or_else(|| auth.get("account_id"))
+        .and_then(|v| v.as_str())
         .map(|s| s.to_string())
 }
 

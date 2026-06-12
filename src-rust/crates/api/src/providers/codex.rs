@@ -121,6 +121,7 @@ impl CodexProvider {
             "grant_type": "refresh_token",
             "client_id": claurst_core::codex_oauth::CODEX_CLIENT_ID,
             "refresh_token": refresh_token,
+            "scope": "openid profile email offline_access",
         });
 
         let resp = self
@@ -191,6 +192,8 @@ impl CodexProvider {
                 + secs
         });
 
+        let new_id_token = json_val.get("id_token").and_then(|v| v.as_str()).map(|s| s.to_string());
+
         // Persist and cache the refreshed tokens.
         let mut updated = {
             let guard = self.tokens.lock().unwrap();
@@ -201,6 +204,17 @@ impl CodexProvider {
             updated.refresh_token = Some(r);
         }
         updated.expires_at = new_expires_at;
+        if new_id_token.is_some() {
+            // Derive account_id from refreshed id_token.
+            let new_account_id = new_id_token
+                .as_deref()
+                .and_then(|t| claurst_core::accounts::jwt_identity(t).account_id)
+                .or_else(|| claurst_core::accounts::jwt_identity(&new_access).account_id);
+            if new_account_id.is_some() {
+                updated.account_id = new_account_id;
+            }
+            updated.id_token = new_id_token;
+        }
 
         if let Err(e) = save_codex_tokens(&updated) {
             warn!("Failed to persist refreshed Codex tokens: {}", e);

@@ -408,12 +408,82 @@ pub fn build_auth_url(
 pub struct CodexTokens {
     pub access_token: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub id_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
     /// Unix timestamp in seconds when the access token expires
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
+}
+
+impl CodexTokens {
+    /// Attempt a silent refresh using the stored refresh token.
+    pub async fn refresh(&self) -> Option<Self> {
+        use crate::codex_oauth::{CODEX_CLIENT_ID, CODEX_TOKEN_URL};
+
+        let rt = self.refresh_token.clone()?;
+        let body = serde_json::json!({
+            "grant_type": "refresh_token",
+            "refresh_token": rt,
+            "client_id": CODEX_CLIENT_ID,
+            "scope": "openid profile email offline_access",
+        });
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .ok()?;
+        let resp = match client
+            .post(CODEX_TOKEN_URL)
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "Codex OAuth token refresh request failed");
+                return None;
+            }
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                status = %status,
+                body = %body_text,
+                "Codex OAuth token refresh returned non-2xx response"
+            );
+            return None;
+        }
+        let data = resp.json::<serde_json::Value>().await.ok()?;
+        let new_at = data["access_token"].as_str().filter(|s| !s.is_empty())?.to_string();
+        let new_rt = data["refresh_token"].as_str().map(String::from).or_else(|| self.refresh_token.clone());
+        let new_id_token = data["id_token"].as_str().map(String::from);
+        let exp_in = data["expires_in"].as_u64().unwrap_or(3600);
+        let expires_at = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                + exp_in,
+        );
+        // Derive account_id from id_token (preferred) or access_token.
+        let new_account_id = new_id_token
+            .as_deref()
+            .and_then(|t| crate::accounts::jwt_identity(t).account_id)
+            .or_else(|| crate::accounts::jwt_identity(&new_at).account_id)
+            .or_else(|| self.account_id.clone());
+        let mut refreshed = self.clone();
+        refreshed.access_token = new_at;
+        refreshed.id_token = new_id_token.or_else(|| self.id_token.clone());
+        refreshed.refresh_token = new_rt;
+        refreshed.expires_at = expires_at;
+        refreshed.account_id = new_account_id;
+        let _ = save_codex_tokens(&refreshed);
+        Some(refreshed)
+    }
 }
 
 /// Legacy single-file path: `~/.claurst/codex_tokens.json`. Kept for

@@ -342,11 +342,16 @@ pub fn jwt_identity(token: &str) -> JwtIdentity {
     }
 
     // OpenAI puts account_id under the custom auth claim.
+    // Prefer chatgpt_account_id (used in id_token); fall back to account_id.
     if let Some(auth) = json
         .get("https://api.openai.com/auth")
         .and_then(|v| v.as_object())
     {
-        if let Some(id) = auth.get("account_id").and_then(|v| v.as_str()) {
+        let id = auth
+            .get("chatgpt_account_id")
+            .and_then(|v| v.as_str())
+            .or_else(|| auth.get("account_id").and_then(|v| v.as_str()));
+        if let Some(id) = id {
             out.account_id = Some(id.to_string());
         }
     }
