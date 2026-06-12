@@ -8,7 +8,7 @@ name = "claurst"
 path = "src/main.rs"
 
 [features]
-default = ["voice"]
+default = []
 voice = ["claurst-core/voice", "claurst-tui/voice"]
 
 [dependencies]

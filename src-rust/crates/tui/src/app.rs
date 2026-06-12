@@ -3882,23 +3882,6 @@ impl App {
             return false;
         }
 
-        // ---- Voice PTT: plain V press starts recording when voice is on ----
-        // This is the "hold to talk" variant.  The user presses V to begin
-        // recording; releasing V (handled in the run loop) or pressing Enter
-        // stops the capture and triggers transcription.
-        // Only active when voice mode is enabled (voice_recorder is Some) and
-        // the prompt input is in default (non-vim) mode so 'v' doesn't conflict
-        // with vim keybindings.
-        if key.code == KeyCode::Char('v')
-            && key.modifiers == KeyModifiers::NONE
-            && self.voice_recorder.is_some()
-            && !self.voice_recording
-            && self.prompt_input.vim_mode == crate::prompt_input::VimMode::Insert
-        {
-            self.handle_voice_ptt_start();
-            return false;
-        }
-
         // ---- Ctrl+V / Cmd+V — clipboard paste (image first, then text fallback) ----
         // Only fires when NOT in vim Normal/Visual/VisualBlock mode (where \x16 is
         // already consumed by the vim handler above to enter VisualBlock mode).
@@ -6200,20 +6183,7 @@ impl App {
                 };
                 match event {
                     Event::Key(key) => {
-                        // On Windows crossterm fires both Press and Release events.
-                        // We normally skip non-press events, but when voice PTT mode
-                        // is active we need the Release event for the `V` key so we
-                        // can stop recording as soon as the user lifts the key.
                         if key.kind != crossterm::event::KeyEventKind::Press {
-                            // Handle V-key release to stop PTT recording.
-                            if key.kind == crossterm::event::KeyEventKind::Release
-                                && key.code == KeyCode::Char('v')
-                                && key.modifiers == KeyModifiers::NONE
-                                && self.voice_recording
-                                && self.voice_recorder.is_some()
-                            {
-                                self.handle_voice_ptt_stop();
-                            }
                             continue;
                         }
 
